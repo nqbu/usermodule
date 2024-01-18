@@ -1,0 +1,176 @@
+@startuml
+
+skinparam Padding 0
+skinparam DefaultTextAlignment center
+skinparam ArrowMessageAlignment center
+skinparam noteTextAlignment left
+skinparam Shadowing false
+
+hide footbox
+autonumber "[#]"
+
+skinparam roundcorner 10
+skinparam note {
+  FontSize 10
+}
+skinparam hnote {
+  FontSize 14
+}
+
+title "Authentication"
+
+participant "Front" as front
+participant "api-gw" as apigw
+participant "Back" as back
+participant "emp-int-sevice" as serv
+participant "OTP" as otp
+participant "sms" as sms
+database "Redis" as redis
+database Postgres as pg
+
+' Первый шаг аутентификации
+group Первый шаг аутентификации
+  front -> apigw: **/sp/auth/step1**
+  activate apigw
+  apigw -> back: **/auth/step1**
+  note left
+    {
+      "msisdn": "string",
+      "password": "string"
+    }
+  end note
+  activate back
+  back -> back: validate
+  rnote right of back #fcbeb6: Если невалидно - переход на шаг 14
+  back -> serv: /getcustomerbymsisdnandpassword
+  activate serv
+  serv --> back: customer data
+  hnote right of back #9cf0e7: Логируем http-взаимодействие в очередь\nC RQ.CH.http.external.log
+  note right: берем только\nid, blocked
+  back -> serv: /sendotpbysms
+  note left
+    {
+    "customer_id": customer_id
+    }
+  end note
+  serv -> serv: customer
+  serv -> otp: /create_code
+  activate otp
+  note left
+    {
+    "service_id": config.functional.serviceId,
+    "citizen_id": customer.id,
+    "preset": config.functional.preset
+    }
+  end note
+  otp --> serv: code
+  deactivate otp
+  note right
+    {
+    "otp": "string"
+    }
+  end note
+  serv -> sms: /message/output
+  activate sms
+  note left
+    {
+    "source": config.functional.source,
+    "destination": customer.phone_number,
+    "message": cfg.functional.messageTemplate,
+    "ext_message_id": logPrefix
+    }
+  end note
+  sms --> serv: OK
+  deactivate sms
+  note right
+    {
+    "emp_message_id": ObjectId,
+    "ext_message_id": ext_message_id
+    }
+  end note
+  serv --> back: OK
+  hnote right of back #9cf0e7: Логируем http-взаимодействие в очередь\nC RQ.CH.http.external.log
+  deactivate serv
+  note right
+    {
+    "emp_message_id": emp_message_id
+    }
+  end note
+  back -> back: generate tempToken
+  back -> redis: emp-admin-serviceprovider:<msisdn>:<tempToken> = customer_id
+  back --> apigw: http response
+  deactivate back
+  apigw --> front: http response
+  deactivate apigw
+  hnote left of back #9cf0e7: Логируем работу ws в очередь\nC RQ.ws.log
+  note right
+    {
+    "tempToken": tempToken
+    }
+  end note
+  
+end
+
+' Второй шаг аутентификации
+
+group Второй шаг аутентификации
+  front -> apigw: **/sp/auth/step2**
+  activate apigw
+  apigw -> back: **/auth/step2**
+  note left
+    {
+    "msisdn": int,
+    "tempToken": string,
+    "code": string
+    }
+  end note
+  activate back
+  back -> back: validate
+  rnote right of back #fcbeb6: Если невалидно - переход на шаг 30
+  back -> redis: get customer_id
+    redis --> back
+    back -> serv: /checkotpbysms
+    activate serv
+    serv -> otp: /check_code
+    note left
+      {
+      "service_id": service_id,
+      "citizen_id": msisdn,
+      "otp": otp
+      }
+    end note
+    otp --> serv
+    note right
+      {
+      "isValid": true
+      }
+      или 500 + "Не верный код"
+    end note
+    serv --> back: "result": []
+    hnote right of back #9cf0e7: Логируем http-взаимодействие в очередь\nC RQ.CH.http.external.log
+    deactivate serv
+    note left
+      {
+      "customer_id": customer_id,
+      "otp": code
+      }
+    end note
+    back -> back: generate session_id
+    back -> pg: msisdn, session_id, expiration_time
+    pg --> back
+    back -> redis: emp-admin-serviceprovider:session_id:<session_id> = <session_id>
+    redis --> back
+    back -> redis: remove tempToken
+    redis --> back
+    back --> apigw: http response
+    deactivate back
+    apigw --> front: http response
+    deactivate apigw
+    hnote left of back #9cf0e7: Логируем работу ws в очередь\nC RQ.ws.log
+    note right
+      {
+      "session_id": session_id
+      }
+    end note
+  end
+  @enduml
